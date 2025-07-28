@@ -1,403 +1,429 @@
+// src/hooks/useStakePool.ts
+// -----------------------------------------------------------------------------
+// Stateless React hook that wires the Stake‑Pool Dashboard UI to the on‑chain
+// SPL‑Stake‑Pool program. Every public method returns the confirmed tx signature
+// so callers can surface it in the UI / explorer links.
+// -----------------------------------------------------------------------------
 import { useToast } from "@/hooks/use-toast";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
-  getAssociatedTokenAddress,
+  getAssociatedTokenAddressSync,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
-import { LAMPORTS_PER_SOL, PublicKey, Transaction } from "@solana/web3.js";
-import { useState } from "react";
-
-export interface StakePoolData {
-  address: string;
-  name: string;
-  apy: number;
-  totalStaked: number;
-  userStaked: number;
-  validatorCount: number;
-  poolTokenSupply: number;
-  lastUpdateEpoch: number;
-  status: "active" | "inactive";
-  manager?: PublicKey;
-  staker?: PublicKey;
-  fee?: number;
-  withdrawalFee?: number;
-  depositFee?: number;
+import {
+  LAMPORTS_PER_SOL,
+  PublicKey,
+  Transaction,
+  VersionedTransaction,
+} from "@solana/web3.js";
+import { useCallback, useState } from "react";
+import {
+  addValidatorToPool as splAddValidatorToPool,
+  removeValidatorFromPool as splRemoveValidatorFromPool,
+  depositSol as splDepositSol,
+  withdrawSol as splWithdrawSol,
+  depositStake as splDepositStake,
+  withdrawStake as splWithdrawStake,
+  updateStakePool,
+  getStakePoolAccount,
+  stakePoolInfo,
+} from "@solana/spl-stake-pool";
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+export interface StakePoolApi {
+  depositSol(pool: string, lamports: number): Promise<string>;
+  withdrawSol(pool: string, poolTokens: number): Promise<string>;
+  depositStake(
+    pool: string,
+    voteAcc: string,
+    stakeAcc: string
+  ): Promise<string>;
+  withdrawStake(
+    pool: string,
+    amount: number,
+    voteAcc?: string
+  ): Promise<string>;
+  addValidatorToPool(pool: string, voteAcc: string): Promise<string>;
+  removeValidatorFromPool(pool: string, voteAcc: string): Promise<string>;
+  updateStakePoolBalance(pool: string): Promise<string>;
+  loading: boolean;
 }
-
-export const useStakePool = () => {
+// -----------------------------------------------------------------------------
+// Shared helper to send & confirm a transaction
+// -----------------------------------------------------------------------------
+async function sendAndConfirm(
+  connection: ReturnType<typeof useConnection>["connection"],
+  walletSend: ReturnType<typeof useWallet>["sendTransaction"],
+  tx: Transaction | VersionedTransaction,
+  signers: Parameters<
+    ReturnType<typeof useWallet>["sendTransaction"]
+  >[2]["signers"] = []
+) {
+  const sig = await walletSend(tx, connection, { signers });
+  await connection.confirmTransaction(sig, "confirmed");
+  return sig;
+}
+// -----------------------------------------------------------------------------
+// Hook implementation
+// -----------------------------------------------------------------------------
+export const useStakePool = (): StakePoolApi => {
   const { connection } = useConnection();
   const { publicKey, sendTransaction } = useWallet();
   const { toast } = useToast();
   const [loading, setLoading] = useState(false);
-
-  // Initialize a new stake pool (not typically done from frontend)
-  const initializeStakePool = async (params: {
-    fee: number;
-    withdrawalFee: number;
-    depositFee: number;
-    maxValidators: number;
-  }) => {
-    toast({
-      title: "Not Implemented",
-      description:
-        "Stake pool initialization should be done via CLI or admin tool.",
-      variant: "destructive",
-    });
-    throw new Error(
-      "Stake pool initialization is not implemented in frontend."
-    );
-  };
-
-  // Deposit SOL and receive pool tokens
-  const depositSol = async (stakePoolAddress: string, lamports: number) => {
-    if (!publicKey) throw new Error("Wallet not connected");
-    setLoading(true);
-    try {
-      const { depositSol, stakePoolInfo } = await import(
-        "@solana/spl-stake-pool"
-      );
-      const stakePoolPubkey = new PublicKey(stakePoolAddress);
-
-      // Fetch stake pool info to get pool mint
-      const info = await stakePoolInfo(connection, stakePoolPubkey);
-      const poolMint = new PublicKey(info.poolMint);
-
-      // Get user's associated pool token account
-      const userPoolTokenAccount = await getAssociatedTokenAddress(
-        poolMint,
-        publicKey,
-        false,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      );
-
-      // Build deposit instructions
-      const { instructions, signers } = await depositSol(
-        connection,
-        stakePoolPubkey,
-        publicKey,
-        lamports,
-        userPoolTokenAccount
-      );
-
-      // Build and send transaction
-      const tx = new Transaction();
-      tx.add(...instructions);
-      const signature = await sendTransaction(tx, connection, { signers });
-      await connection.confirmTransaction(signature, "confirmed");
-
-      toast({
-        title: "SOL Deposited",
-        description: `Successfully deposited ${
-          lamports / LAMPORTS_PER_SOL
-        } SOL`,
-      });
-      return signature;
-    } catch (error) {
-      console.error("Deposit failed:", error);
-      toast({
-        title: "Deposit Failed",
-        description: "Failed to deposit SOL to stake pool",
-        variant: "destructive",
-      });
-      throw error;
-    } finally {
-      setLoading(false);
+  // Helper to ensure wallet is connected
+  const requireWallet = useCallback(() => {
+    if (!publicKey) {
+      throw new Error("Wallet not connected");
     }
-  };
-
-  // Withdraw SOL by burning pool tokens
-  const withdrawSol = async (
-    stakePoolAddress: string,
-    poolTokenAmount: number
-  ) => {
-    if (!publicKey) throw new Error("Wallet not connected");
-    setLoading(true);
-    try {
-      const { withdrawSol, stakePoolInfo } = await import(
-        "@solana/spl-stake-pool"
-      );
-      const stakePoolPubkey = new PublicKey(stakePoolAddress);
-      const info = await stakePoolInfo(connection, stakePoolPubkey);
-      const poolMint = new PublicKey(info.poolMint);
-      const userPoolTokenAccount = await getAssociatedTokenAddress(
-        poolMint,
-        publicKey,
-        false,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      );
-      // Withdraw SOL to user's wallet
-      const { instructions, signers } = await withdrawSol(
-        connection,
-        stakePoolPubkey,
-        publicKey,
-        publicKey, // solReceiver
-        poolTokenAmount
-      );
-      const tx = new Transaction();
-      tx.add(...instructions);
-      const signature = await sendTransaction(tx, connection, { signers });
-      await connection.confirmTransaction(signature, "confirmed");
-      toast({
-        title: "SOL Withdrawn",
-        description: `Successfully withdrew SOL from stake pool`,
-      });
-      return signature;
-    } catch (error) {
-      console.error("Withdraw failed:", error);
-      toast({
-        title: "Withdrawal Failed",
-        description: "Failed to withdraw SOL from stake pool",
-        variant: "destructive",
-      });
-      throw error;
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Add validator to pool
-  const addValidatorToPool = async (
-    stakePoolAddress: string,
-    voteAccount: string
-  ) => {
-    if (!publicKey) throw new Error("Wallet not connected");
-    setLoading(true);
-    try {
-      const { addValidatorToPool } = await import("@solana/spl-stake-pool");
-      const stakePoolPubkey = new PublicKey(stakePoolAddress);
-      const votePubkey = new PublicKey(voteAccount);
-      const { instructions } = await addValidatorToPool(
-        connection,
-        stakePoolPubkey,
-        votePubkey
-      );
-      const tx = new Transaction();
-      tx.add(...instructions);
-      const signature = await sendTransaction(tx, connection);
-      await connection.confirmTransaction(signature, "confirmed");
-      toast({
-        title: "Validator Added",
-        description: "Successfully added validator to stake pool",
-      });
-      return signature;
-    } catch (error) {
-      console.error("Add validator failed:", error);
-      toast({
-        title: "Add Validator Failed",
-        description: "Failed to add validator to stake pool",
-        variant: "destructive",
-      });
-      throw error;
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Remove validator from pool
-  const removeValidatorFromPool = async (
-    stakePoolAddress: string,
-    voteAccount: string
-  ) => {
-    if (!publicKey) throw new Error("Wallet not connected");
-    setLoading(true);
-    try {
-      const { removeValidatorFromPool } = await import(
-        "@solana/spl-stake-pool"
-      );
-      const stakePoolPubkey = new PublicKey(stakePoolAddress);
-      const votePubkey = new PublicKey(voteAccount);
-      const { instructions } = await removeValidatorFromPool(
-        connection,
-        stakePoolPubkey,
-        votePubkey
-      );
-      const tx = new Transaction();
-      tx.add(...instructions);
-      const signature = await sendTransaction(tx, connection);
-      await connection.confirmTransaction(signature, "confirmed");
-      toast({
-        title: "Validator Removed",
-        description: "Successfully removed validator from stake pool",
-      });
-      return signature;
-    } catch (error) {
-      console.error("Remove validator failed:", error);
-      toast({
-        title: "Remove Validator Failed",
-        description: "Failed to remove validator from stake pool",
-        variant: "destructive",
-      });
-      throw error;
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Update stake pool balance
-  const updateStakePoolBalance = async (stakePoolAddress: string) => {
-    if (!publicKey) throw new Error("Wallet not connected");
-    setLoading(true);
-    try {
-      const { getStakePoolAccount, updateStakePool } = await import(
-        "@solana/spl-stake-pool"
-      );
-      const stakePoolPubkey = new PublicKey(stakePoolAddress);
-      const stakePoolAccount = await getStakePoolAccount(
-        connection,
-        stakePoolPubkey
-      );
-      const { updateListInstructions, finalInstructions } =
-        await updateStakePool(connection, stakePoolAccount);
-      const tx = new Transaction();
-      tx.add(...updateListInstructions, ...finalInstructions);
-      const signature = await sendTransaction(tx, connection);
-      await connection.confirmTransaction(signature, "confirmed");
-      toast({
-        title: "Balance Updated",
-        description: "Successfully updated stake pool balance",
-      });
-      return signature;
-    } catch (error) {
-      console.error("Update balance failed:", error);
-      toast({
-        title: "Update Failed",
-        description: "Failed to update stake pool balance",
-        variant: "destructive",
-      });
-      throw error;
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Deposit a stake account into the pool
-  const depositStake = async (
-    stakePoolAddress: string,
-    validatorVote: string,
-    depositStakePubkey: string
-  ) => {
-    if (!publicKey) throw new Error("Wallet not connected");
-    setLoading(true);
-    try {
-      const { depositStake, stakePoolInfo } = await import(
-        "@solana/spl-stake-pool"
-      );
-      const stakePoolPubkey = new PublicKey(stakePoolAddress);
-      const votePubkey = new PublicKey(validatorVote);
-      const depositStakeKey = new PublicKey(depositStakePubkey);
-      const info = await stakePoolInfo(connection, stakePoolPubkey);
-      const poolMint = new PublicKey(info.poolMint);
-      const userPoolTokenAccount = await getAssociatedTokenAddress(
-        poolMint,
-        publicKey,
-        false,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      );
-      const { instructions, signers } = await depositStake(
-        connection,
-        stakePoolPubkey,
-        publicKey,
-        votePubkey,
-        depositStakeKey,
-        userPoolTokenAccount
-      );
-      const tx = new Transaction();
-      tx.add(...instructions);
-      const signature = await sendTransaction(tx, connection, { signers });
-      await connection.confirmTransaction(signature, "confirmed");
-      toast({
-        title: "Stake Deposited",
-        description: "Successfully deposited stake account to pool",
-      });
-      return signature;
-    } catch (error) {
-      console.error("Deposit stake failed:", error);
-      toast({
-        title: "Deposit Stake Failed",
-        description: "Failed to deposit stake account to pool",
-        variant: "destructive",
-      });
-      throw error;
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Withdraw a stake account from the pool
-  const withdrawStake = async (
-    stakePoolAddress: string,
-    amount: number,
-    voteAccount?: string
-  ) => {
-    if (!publicKey) throw new Error("Wallet not connected");
-    setLoading(true);
-    try {
-      const { withdrawStake, stakePoolInfo } = await import(
-        "@solana/spl-stake-pool"
-      );
-      const stakePoolPubkey = new PublicKey(stakePoolAddress);
-      const info = await stakePoolInfo(connection, stakePoolPubkey);
-      const poolMint = new PublicKey(info.poolMint);
-      const userPoolTokenAccount = await getAssociatedTokenAddress(
-        poolMint,
-        publicKey,
-        false,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      );
-      // Optionally withdraw from a specific validator
-      const votePubkey = voteAccount ? new PublicKey(voteAccount) : undefined;
-      const { instructions, signers } = await withdrawStake(
-        connection,
-        stakePoolPubkey,
-        publicKey,
-        amount,
-        false, // useReserve
-        votePubkey,
-        undefined, // stakeReceiver (let program create)
-        userPoolTokenAccount
-      );
-      const tx = new Transaction();
-      tx.add(...instructions);
-      const signature = await sendTransaction(tx, connection, { signers });
-      await connection.confirmTransaction(signature, "confirmed");
-      toast({
-        title: "Stake Withdrawn",
-        description: "Successfully withdrew stake from pool",
-      });
-      return signature;
-    } catch (error) {
-      console.error("Withdraw stake failed:", error);
-      toast({
-        title: "Withdraw Stake Failed",
-        description: "Failed to withdraw stake from pool",
-        variant: "destructive",
-      });
-      throw error;
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Slippage-protected functions are not available in the current @solana/spl-stake-pool JS SDK.
-  // To implement slippage protection, check the expected output before/after the transaction
-  // and warn/cancel if the result is below the user's threshold.
-  // See: https://spl.solana.com/stake-pool for more details.
-
+    return publicKey;
+  }, [publicKey]);
+  // ---------------------------------------------------------------------------
+  // depositSol
+  // ---------------------------------------------------------------------------
+  const depositSol = useCallback<StakePoolApi["depositSol"]>(
+    async (pool, lamports) => {
+      const user = requireWallet();
+      setLoading(true);
+      try {
+        const poolPk = new PublicKey(pool);
+        const { poolMint } = await stakePoolInfo(connection, poolPk);
+        // --- Ensure correct parameter order and types for getAssociatedTokenAddressSync ---
+        // --- Reverted bigint conversion: Pass lamports as number ---
+        const ata = getAssociatedTokenAddressSync(
+          new PublicKey(poolMint), // mint: PublicKey
+          user, // owner: PublicKey
+          false, // allowOwnerOffCurve: boolean
+          TOKEN_PROGRAM_ID, // programId: PublicKey
+          ASSOCIATED_TOKEN_PROGRAM_ID // associatedTokenProgramId: PublicKey
+        );
+        // --- Pass lamports directly as number ---
+        const { instructions, signers } = await splDepositSol(
+          connection,
+          poolPk,
+          user, // stakePoolAuthority / depositor: PublicKey
+          lamports, // amount: number
+          ata // tokenAccount: PublicKey
+        );
+        const tx = new Transaction().add(...instructions);
+        const sig = await sendAndConfirm(
+          connection,
+          sendTransaction,
+          tx,
+          signers
+        );
+        toast({
+          title: "Deposited SOL",
+          description: `Deposited ${(lamports / LAMPORTS_PER_SOL).toFixed(
+            2
+          )} SOL`,
+        });
+        return sig;
+      } catch (err) {
+        console.error(err);
+        toast({
+          title: "Deposit failed",
+          description: (err as Error).message ?? "Unknown error",
+          variant: "destructive",
+        });
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [connection, requireWallet, sendTransaction, toast]
+  );
+  // ---------------------------------------------------------------------------
+  // withdrawSol
+  // ---------------------------------------------------------------------------
+  const withdrawSol = useCallback<StakePoolApi["withdrawSol"]>(
+    async (pool, poolTokens) => {
+      const user = requireWallet();
+      setLoading(true);
+      try {
+        const poolPk = new PublicKey(pool);
+        const { poolMint } = await stakePoolInfo(connection, poolPk);
+        // --- Ensure correct parameter order and types for getAssociatedTokenAddressSync ---
+        // --- Reverted bigint conversion: Pass poolTokens as number ---
+        const ata = getAssociatedTokenAddressSync(
+          new PublicKey(poolMint), // mint: PublicKey
+          user, // owner: PublicKey
+          false, // allowOwnerOffCurve: boolean
+          TOKEN_PROGRAM_ID, // programId: PublicKey
+          ASSOCIATED_TOKEN_PROGRAM_ID // associatedTokenProgramId: PublicKey
+        );
+        // --- Pass poolTokens directly as number ---
+        const { instructions, signers } = await splWithdrawSol(
+          connection,
+          poolPk,
+          user, // stakePoolAuthority / withdrawer: PublicKey
+          user, // solReceiver: PublicKey
+          poolTokens, // poolTokens: number
+          ata // tokenAccount: PublicKey
+        );
+        const tx = new Transaction().add(...instructions);
+        const sig = await sendAndConfirm(
+          connection,
+          sendTransaction,
+          tx,
+          signers
+        );
+        toast({
+          title: "Withdrew SOL",
+          description: "Pool tokens burned for SOL",
+        });
+        return sig;
+      } catch (err) {
+        console.error(err);
+        toast({
+          title: "Withdrawal failed",
+          description: (err as Error).message,
+          variant: "destructive",
+        });
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [connection, requireWallet, sendTransaction, toast]
+  );
+  // ---------------------------------------------------------------------------
+  // depositStake
+  // ---------------------------------------------------------------------------
+  const depositStake = useCallback<StakePoolApi["depositStake"]>(
+    async (pool, voteAcc, stakeAcc) => {
+      const user = requireWallet();
+      setLoading(true);
+      try {
+        const poolPk = new PublicKey(pool);
+        const votePk = new PublicKey(voteAcc);
+        const stakePk = new PublicKey(stakeAcc);
+        const { poolMint } = await stakePoolInfo(connection, poolPk);
+        // --- Ensure correct parameter order and types for getAssociatedTokenAddressSync ---
+        const ata = getAssociatedTokenAddressSync(
+          new PublicKey(poolMint), // mint: PublicKey
+          user, // owner: PublicKey
+          false, // allowOwnerOffCurve: boolean
+          TOKEN_PROGRAM_ID, // programId: PublicKey
+          ASSOCIATED_TOKEN_PROGRAM_ID // associatedTokenProgramId: PublicKey
+        );
+        // --- Ensure PublicKey parameters are passed correctly ---
+        const { instructions, signers } = await splDepositStake(
+          connection,
+          poolPk, // stakePoolAddress: PublicKey
+          user, // stakePoolAuthority / depositor: PublicKey
+          votePk, // validatorVote: PublicKey
+          stakePk, // stakeAccount: PublicKey
+          ata // tokenAccount: PublicKey
+        );
+        const sig = await sendAndConfirm(
+          connection,
+          sendTransaction,
+          new Transaction().add(...instructions),
+          signers
+        );
+        toast({
+          title: "Deposited stake",
+          description: "Stake account merged into pool",
+        });
+        return sig;
+      } catch (err) {
+        console.error(err);
+        toast({
+          title: "Deposit stake failed",
+          description: (err as Error).message,
+          variant: "destructive",
+        });
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [connection, requireWallet, sendTransaction, toast]
+  );
+  // ---------------------------------------------------------------------------
+  // withdrawStake
+  // ---------------------------------------------------------------------------
+  const withdrawStake = useCallback<StakePoolApi["withdrawStake"]>(
+    async (pool, amount, voteAcc) => {
+      const user = requireWallet();
+      setLoading(true);
+      try {
+        const poolPk = new PublicKey(pool);
+        const { poolMint } = await stakePoolInfo(connection, poolPk);
+        // --- Ensure correct parameter order and types for getAssociatedTokenAddressSync ---
+        // --- Reverted bigint conversion: Pass amount as number ---
+        const ata = getAssociatedTokenAddressSync(
+          new PublicKey(poolMint), // mint: PublicKey
+          user, // owner: PublicKey
+          false, // allowOwnerOffCurve: boolean
+          TOKEN_PROGRAM_ID, // programId: PublicKey
+          ASSOCIATED_TOKEN_PROGRAM_ID // associatedTokenProgramId: PublicKey
+        );
+        // --- Pass amount directly as number ---
+        const votePk = voteAcc ? new PublicKey(voteAcc) : undefined; // Optional validatorVote
+        const { instructions, signers } = await splWithdrawStake(
+          connection,
+          poolPk, // stakePoolAddress: PublicKey
+          user, // stakePoolAuthority / withdrawer: PublicKey
+          amount, // amount: number
+          ata, // tokenAccount: PublicKey
+          votePk // validatorVote (optional): PublicKey | undefined
+        );
+        const sig = await sendAndConfirm(
+          connection,
+          sendTransaction,
+          new Transaction().add(...instructions),
+          signers
+        );
+        toast({
+          title: "Withdrew stake",
+          description: "Stake account withdrawn from pool",
+        });
+        return sig;
+      } catch (err) {
+        console.error(err);
+        toast({
+          title: "Withdraw stake failed",
+          description: (err as Error).message,
+          variant: "destructive",
+        });
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [connection, requireWallet, sendTransaction, toast]
+  );
+  // ---------------------------------------------------------------------------
+  // addValidatorToPool
+  // ---------------------------------------------------------------------------
+  const addValidatorToPool = useCallback<StakePoolApi["addValidatorToPool"]>(
+    async (pool, voteAcc) => {
+      const user = requireWallet(); // manager
+      setLoading(true);
+      try {
+        const poolPk = new PublicKey(pool);
+        const votePk = new PublicKey(voteAcc);
+        // --- Ensure PublicKey parameters are passed correctly ---
+        const { instructions } = await splAddValidatorToPool(
+          connection,
+          poolPk, // stakePoolAddress: PublicKey
+          votePk, // validatorVote: PublicKey
+          user // stakePoolAuthority (manager): PublicKey
+        );
+        const sig = await sendAndConfirm(
+          connection,
+          sendTransaction,
+          new Transaction().add(...instructions)
+        );
+        toast({ title: "Validator added", description: votePk.toBase58() });
+        return sig;
+      } catch (err) {
+        console.error(err);
+        toast({
+          title: "Add validator failed",
+          description: (err as Error).message,
+          variant: "destructive",
+        });
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [connection, requireWallet, sendTransaction, toast]
+  );
+  // ---------------------------------------------------------------------------
+  // removeValidatorFromPool
+  // ---------------------------------------------------------------------------
+  const removeValidatorFromPool = useCallback<
+    StakePoolApi["removeValidatorFromPool"]
+  >(
+    async (pool, voteAcc) => {
+      const user = requireWallet();
+      setLoading(true);
+      try {
+        const poolPk = new PublicKey(pool);
+        const votePk = new PublicKey(voteAcc);
+        // --- Ensure PublicKey parameters are passed correctly ---
+        const { instructions } = await splRemoveValidatorFromPool(
+          connection,
+          poolPk, // stakePoolAddress: PublicKey
+          votePk, // validatorVote: PublicKey
+          user // stakePoolAuthority (manager): PublicKey
+        );
+        const sig = await sendAndConfirm(
+          connection,
+          sendTransaction,
+          new Transaction().add(...instructions)
+        );
+        toast({ title: "Validator removed", description: votePk.toBase58() });
+        return sig;
+      } catch (err) {
+        console.error(err);
+        toast({
+          title: "Remove validator failed",
+          description: (err as Error).message,
+          variant: "destructive",
+        });
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [connection, requireWallet, sendTransaction, toast]
+  );
+  // ---------------------------------------------------------------------------
+  // updateStakePoolBalance
+  // ---------------------------------------------------------------------------
+  const updateStakePoolBalance = useCallback<
+    StakePoolApi["updateStakePoolBalance"]
+  >(
+    async (pool) => {
+      const user = requireWallet();
+      setLoading(true);
+      try {
+        const poolPk = new PublicKey(pool);
+        const stakePoolAcct = await getStakePoolAccount(connection, poolPk);
+        // --- Ensure PublicKey parameters are passed correctly ---
+        const { updateListInstructions, finalInstructions } =
+          await updateStakePool(
+            connection,
+            stakePoolAcct, // stakePool: StakePoolAccount
+            user // stakePoolAuthority: PublicKey
+          );
+        const tx = new Transaction().add(
+          ...updateListInstructions,
+          ...finalInstructions
+        );
+        const sig = await sendAndConfirm(connection, sendTransaction, tx);
+        toast({ title: "Pool balance updated" });
+        return sig;
+      } catch (err) {
+        console.error(err);
+        toast({
+          title: "Update failed",
+          description: (err as Error).message,
+          variant: "destructive",
+        });
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [connection, requireWallet, sendTransaction, toast]
+  );
+  // expose API
   return {
     loading,
-    initializeStakePool,
     depositSol,
     withdrawSol,
+    depositStake,
+    withdrawStake,
     addValidatorToPool,
     removeValidatorFromPool,
     updateStakePoolBalance,
-    depositStake,
-    withdrawStake,
-    // Slippage protection: implement in UI/client as needed
   };
 };
